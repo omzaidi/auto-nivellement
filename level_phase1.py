@@ -18,6 +18,7 @@ except ImportError:
 
 # -------------------------- User-editable settings --------------------------
 INPUT_SHP = Path("shp/AG_Fusionn_imp.shp")
+LOD_REFERENCE_SHP = Path("shp/AG_Fusionn_imp.shp")
 OUTPUT_DIR = Path("output")
 
 PROJECT_COLUMN = "NUMR_PROJ_"
@@ -32,8 +33,8 @@ MAX_PCT_EQUAL_LOD = 0.30
 LOD_EQUALITY_ATOL = 1e-12
 
 # Pairing / regression
-MIN_PAIR_COUNT = 30
-MAX_PAIR_COUNT = 1000
+MIN_PAIR_COUNT = 10
+MAX_PAIR_COUNT = 10000
 MIN_CANDIDATE_UNIQUE_VALUES = 3
 TRIM_LOWER_QUANTILE = 0.1
 TRIM_UPPER_QUANTILE = 0.9
@@ -41,11 +42,11 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 
 # Outputs
 SAVE_REGRESSION_PLOTS = True
-REGRESSION_PLOTS_DIRNAME = "regression_plots"
-FINAL_OUTPUT_NAME = "leveled_full_overlap.shp"
-LOG_CSV_NAME = "leveling_log.csv"
-SURVEY_QA_CSV_NAME = "survey_levelability.csv"
-EXCLUDED_SURVEYS_CSV_NAME = "excluded_surveys.csv"
+REGRESSION_PLOTS_DIRNAME = "phase1_regression_plots"
+FINAL_OUTPUT_NAME = "phase1_leveled_full_overlap.shp"
+LOG_CSV_NAME = "phase1_leveling_log.csv"
+SURVEY_QA_CSV_NAME = "phase1_survey_levelability.csv"
+EXCLUDED_SURVEYS_CSV_NAME = "phase1_excluded_surveys.csv"
 # ---------------------------------------------------------------------------
 
 
@@ -120,6 +121,25 @@ def coerce_numeric_columns(gdf: gpd.GeoDataFrame) -> tuple[int, int]:
     gdf[CENSORED_COLUMN] = cens_vals
 
     return int(raw_vals.isna().sum()), int(imp_vals.isna().sum())
+
+
+def compute_global_min_lod_floor(reference_shp: Path) -> float:
+    lod_gdf = gpd.read_file(reference_shp)
+    missing = sorted({RAW_VALUE_COLUMN, CENSORED_COLUMN}.difference(lod_gdf.columns))
+    if missing:
+        raise KeyError(
+            f"Missing LOD columns in reference shapefile {reference_shp}: {missing}"
+        )
+
+    raw = pd.to_numeric(lod_gdf[RAW_VALUE_COLUMN], errors="coerce")
+    cens = pd.to_numeric(lod_gdf[CENSORED_COLUMN], errors="coerce").fillna(0) >= 1.0
+    lod = raw.where(cens).abs()
+    lod = lod[np.isfinite(lod) & (lod > 0)]
+    if lod.empty:
+        raise ValueError(
+            f"Could not derive a positive global LOD floor from {reference_shp}."
+        )
+    return float(lod.min())
 
 
 def build_survey_levelability(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
@@ -380,8 +400,12 @@ def run_leveling(
     survey_qa: pd.DataFrame,
     final_output_name: str,
     log_csv_name: str,
+    lod_floor: float,
 ) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    gdf[IMPUTED_VALUE_COLUMN] = pd.to_numeric(
+        gdf[IMPUTED_VALUE_COLUMN], errors="coerce"
+    ).clip(lower=lod_floor)
 
     levelable_projects = set(survey_qa.loc[survey_qa["levelable"], PROJECT_COLUMN])
     excluded_quality_projects = set(
@@ -597,6 +621,10 @@ def run_leveling(
 
             step += 1
             apply_correction(gdf, candidate, slope, intercept, step, reference_project)
+            cand_mask = gdf[PROJECT_COLUMN] == candidate
+            gdf.loc[cand_mask, IMPUTED_VALUE_COLUMN] = pd.to_numeric(
+                gdf.loc[cand_mask, IMPUTED_VALUE_COLUMN], errors="coerce"
+            ).clip(lower=lod_floor)
             corrected_projects.add(candidate)
 
             plot_rel = ""
@@ -651,6 +679,9 @@ def run_leveling(
         .difference(excluded_low_unique_values)
     )
     final_out = gdf[gdf[PROJECT_COLUMN].isin(output_projects)].copy()
+    final_out[IMPUTED_VALUE_COLUMN] = pd.to_numeric(
+        final_out[IMPUTED_VALUE_COLUMN], errors="coerce"
+    ).clip(lower=lod_floor)
 
     excluded_df = survey_qa[[PROJECT_COLUMN, "exclude_reason"]].copy()
     if excluded_low_unique_values:
@@ -714,6 +745,8 @@ def main() -> None:
     )
 
     survey_qa = build_survey_levelability(gdf)
+    lod_floor = compute_global_min_lod_floor(LOD_REFERENCE_SHP)
+    print(f"Using global LOD floor from {LOD_REFERENCE_SHP}: {lod_floor:.6g}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     qa_path = OUTPUT_DIR / SURVEY_QA_CSV_NAME
     survey_qa.to_csv(qa_path, index=False)
@@ -724,6 +757,7 @@ def main() -> None:
         survey_qa=survey_qa,
         final_output_name=FINAL_OUTPUT_NAME,
         log_csv_name=LOG_CSV_NAME,
+        lod_floor=lod_floor,
     )
 
 

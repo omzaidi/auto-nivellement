@@ -329,32 +329,111 @@ def save_regression_plot(
         return
 
     corrected = slope * fit_cand + intercept
-    all_vals = np.concatenate([fit_cand, corrected, fit_ref])
-    x_min = float(np.nanmin(all_vals))
-    x_max = float(np.nanmax(all_vals))
+    # Phase-2 style: when full coefficients are provided, draw a two-panel plot
+    # to avoid mixing pre- and post-transformed x-spaces on one axis.
+    if full_slope is not None and full_intercept is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+        ax_pre, ax_post = axes
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(fit_cand, fit_ref, s=12, alpha=0.35, color="#2c7fb8", label="trimmed pre")
-    ax.scatter(corrected, fit_ref, s=12, alpha=0.55, color="#1a9850", label="trimmed post")
-
-    if np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
-        x_line = np.linspace(x_min, x_max, 100)
-        if full_slope is not None and full_intercept is not None:
-            ax.plot(
-                x_line,
-                full_slope * x_line + full_intercept,
+        # Panel A: pre pairs + full fit + applied partial fit + 1:1
+        pre_vals = np.concatenate([fit_cand, fit_ref])
+        pre_min = float(np.nanmin(pre_vals))
+        pre_max = float(np.nanmax(pre_vals))
+        ax_pre.scatter(
+            fit_cand,
+            fit_ref,
+            s=12,
+            alpha=0.4,
+            color="#2c7fb8",
+            label="original points",
+        )
+        if np.isfinite(pre_min) and np.isfinite(pre_max) and pre_max > pre_min:
+            x_pre = np.linspace(pre_min, pre_max, 100)
+            ax_pre.plot(
+                x_pre,
+                full_slope * x_pre + full_intercept,
                 color="#d7301f",
                 lw=1.8,
-                label="full fit",
+                label="original full fit",
             )
-            ax.plot(
-                x_line,
-                slope * x_line + intercept,
+            ax_pre.plot(
+                x_pre,
+                slope * x_pre + intercept,
                 color="#fdae61",
                 lw=1.8,
+                ls="--",
                 label="applied partial fit",
             )
-        else:
+            ax_pre.plot(x_pre, x_pre, color="black", lw=1.2, ls="--", label="1:1")
+        ax_pre.set_title("Pre Space")
+        ax_pre.set_xlabel("Candidate (original)")
+        ax_pre.set_ylabel("Reference")
+        ax_pre.grid(alpha=0.2)
+        ax_pre.legend(loc="best")
+
+        # Panel B: post points + post fit + 1:1
+        post_vals = np.concatenate([corrected, fit_ref])
+        post_min = float(np.nanmin(post_vals))
+        post_max = float(np.nanmax(post_vals))
+        ax_post.scatter(
+            corrected,
+            fit_ref,
+            s=12,
+            alpha=0.55,
+            color="#1a9850",
+            label="partially leveled points",
+        )
+        if np.isfinite(post_min) and np.isfinite(post_max) and post_max > post_min:
+            x_post = np.linspace(post_min, post_max, 100)
+            ax_post.plot(
+                x_post,
+                post_slope * x_post + post_intercept,
+                color="#1b7837",
+                lw=1.8,
+                label="post fit",
+            )
+            ax_post.plot(
+                x_post, x_post, color="black", lw=1.2, ls="--", label="1:1"
+            )
+        ax_post.set_title("Post Space")
+        ax_post.set_xlabel("Candidate (partially leveled)")
+        ax_post.set_ylabel("Reference")
+        ax_post.grid(alpha=0.2)
+        ax_post.legend(loc="best")
+
+        fig.suptitle(
+            f"ref={reference_project} cand={candidate_project} | "
+            f"full=({full_slope:.4f}, {full_intercept:.4f}) "
+            f"applied=({slope:.4f}, {intercept:.4f}) "
+            f"post=({post_slope:.4f}, {post_intercept:.4f})"
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+    else:
+        # Phase-1 style: single-panel full leveling diagnostic.
+        all_vals = np.concatenate([fit_cand, corrected, fit_ref])
+        x_min = float(np.nanmin(all_vals))
+        x_max = float(np.nanmax(all_vals))
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(
+            fit_cand,
+            fit_ref,
+            s=12,
+            alpha=0.35,
+            color="#2c7fb8",
+            label="trimmed pre",
+        )
+        ax.scatter(
+            corrected,
+            fit_ref,
+            s=12,
+            alpha=0.55,
+            color="#1a9850",
+            label="trimmed post",
+        )
+
+        if np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
+            x_line = np.linspace(x_min, x_max, 100)
             ax.plot(
                 x_line,
                 slope * x_line + intercept,
@@ -362,23 +441,19 @@ def save_regression_plot(
                 lw=1.8,
                 label="fit",
             )
-        ax.plot(x_line, x_line, color="black", lw=1.2, ls="--", label="1:1")
+            ax.plot(x_line, x_line, color="black", lw=1.2, ls="--", label="1:1")
 
-    title_text = f"ref={reference_project} cand={candidate_project}\n"
-    if full_slope is not None and full_intercept is not None:
-        title_text += (
-            f"full=({full_slope:.4f}, {full_intercept:.4f}) "
-            f"applied=({slope:.4f}, {intercept:.4f}) "
+        ax.set_title(
+            f"ref={reference_project} cand={candidate_project}\n"
+            f"fit=({slope:.4f}, {intercept:.4f}) "
+            f"post=({post_slope:.4f}, {post_intercept:.4f})"
         )
-    else:
-        title_text += f"fit=({slope:.4f}, {intercept:.4f}) "
-    title_text += f"post=({post_slope:.4f}, {post_intercept:.4f})"
-    ax.set_title(title_text)
-    ax.set_xlabel("Candidate")
-    ax.set_ylabel("Reference")
-    ax.grid(alpha=0.2)
-    ax.legend(loc="best")
-    fig.tight_layout()
+        ax.set_xlabel("Candidate")
+        ax.set_ylabel("Reference")
+        ax.grid(alpha=0.2)
+        ax.legend(loc="best")
+        fig.tight_layout()
+
     fig.savefig(plot_path, dpi=140)
     plt.close(fig)
 

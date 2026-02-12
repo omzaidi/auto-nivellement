@@ -26,7 +26,8 @@ from level_core import (
 )
 
 # -------------------------- User-editable settings --------------------------
-INPUT_SHP = Path("output/leveled_full_overlap.shp")
+INPUT_SHP = Path("output/phase1_leveled_full_overlap.shp")
+LOD_REFERENCE_SHP = Path("shp/AG_Fusionn_imp.shp")
 OUTPUT_DIR = Path("output")
 
 PROJECT_COLUMN = "NUMR_PROJ_"
@@ -41,8 +42,8 @@ MAX_PCT_EQUAL_LOD = 0.30
 LOD_EQUALITY_ATOL = 1e-12
 
 # Pairing / regression
-MIN_PAIR_COUNT = 20
-MAX_PAIR_COUNT = 1000
+MIN_PAIR_COUNT = 10
+MAX_PAIR_COUNT = 10000
 MIN_UNIQUE_VALUES = 3
 TRIM_LOWER_QUANTILE = 0.1
 TRIM_UPPER_QUANTILE = 0.9
@@ -50,9 +51,11 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 
 # Phase-2 cascade parameters (partial leveling)
 BUFFER_DISTANCE_KM = 20.0
+PHASE2_START_REFERENCE_PROJECT = "1997520"
 PARTIAL_LEVELING_RATE = 0.3
-MAX_CYCLES = 50
+MAX_CYCLES = 10
 MIN_CYCLE_UPDATES = 1
+RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE = True
 RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE = True
 RANDOM_SEED = 42
 SKIP_FULL_OVERLAP_PAIRS = True
@@ -69,7 +72,6 @@ KEEP_ALL_PHASE2_INPUT_SURVEYS_IN_OUTPUT = True
 
 # Simple output stabilizer for phase 2
 CLIP_PHASE2_VALUES = True
-PHASE2_MIN_VALUE = 0.0
 PHASE2_MAX_PERCENTILE = 99.0
 # ---------------------------------------------------------------------------
 
@@ -110,6 +112,25 @@ def _init_phase2_columns(gdf: gpd.GeoDataFrame) -> None:
     gdf["P2_STAT"] = "eligible_unleveled"
 
 
+def compute_global_min_lod_floor(reference_shp: Path) -> float:
+    lod_gdf = gpd.read_file(reference_shp)
+    missing = sorted({RAW_VALUE_COLUMN, CENSORED_COLUMN}.difference(lod_gdf.columns))
+    if missing:
+        raise KeyError(
+            f"Missing LOD columns in reference shapefile {reference_shp}: {missing}"
+        )
+
+    raw = pd.to_numeric(lod_gdf[RAW_VALUE_COLUMN], errors="coerce")
+    cens = pd.to_numeric(lod_gdf[CENSORED_COLUMN], errors="coerce").fillna(0) >= 1.0
+    lod = raw.where(cens).abs()
+    lod = lod[np.isfinite(lod) & (lod > 0)]
+    if lod.empty:
+        raise ValueError(
+            f"Could not derive a positive global LOD floor from {reference_shp}."
+        )
+    return float(lod.min())
+
+
 def _apply_phase2_correction(
     gdf: gpd.GeoDataFrame,
     project_id: object,
@@ -144,17 +165,36 @@ def _clip_project_values(
     gdf: gpd.GeoDataFrame,
     project_id: object,
     min_value: float,
-    max_value: float,
+    max_value: float | None = None,
 ) -> None:
     mask = gdf[PROJECT_COLUMN] == project_id
-    gdf.loc[mask, IMPUTED_VALUE_COLUMN] = gdf.loc[mask, IMPUTED_VALUE_COLUMN].clip(
-        lower=min_value,
-        upper=max_value,
-    )
+    vals = pd.to_numeric(gdf.loc[mask, IMPUTED_VALUE_COLUMN], errors="coerce")
+    if max_value is None:
+        gdf.loc[mask, IMPUTED_VALUE_COLUMN] = vals.clip(lower=min_value)
+    else:
+        gdf.loc[mask, IMPUTED_VALUE_COLUMN] = vals.clip(
+            lower=min_value, upper=max_value
+        )
+
+
+def _reference_order_for_cycle(
+    ordered_projects: list[str],
+    start_project: str,
+    rng: np.random.Generator,
+    randomize_tail: bool,
+) -> list[str]:
+    tail = [p for p in ordered_projects if p != start_project]
+    if randomize_tail:
+        rng.shuffle(tail)
+    return [start_project] + tail
 
 
 def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    lod_floor = compute_global_min_lod_floor(LOD_REFERENCE_SHP)
+    gdf[IMPUTED_VALUE_COLUMN] = pd.to_numeric(
+        gdf[IMPUTED_VALUE_COLUMN], errors="coerce"
+    ).clip(lower=lod_floor)
 
     levelable_projects = set(survey_qa.loc[survey_qa["levelable"], PROJECT_COLUMN])
     excluded_quality_projects = set(
@@ -180,7 +220,14 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
         )
 
     ordered_projects = list(counts.index)
-    base_project = ordered_projects[0]
+    if PHASE2_START_REFERENCE_PROJECT in ordered_projects:
+        base_project = PHASE2_START_REFERENCE_PROJECT
+    else:
+        base_project = ordered_projects[0]
+        print(
+            f"Requested phase-2 start reference {PHASE2_START_REFERENCE_PROJECT} "
+            f"not found in levelable projects; fallback to {base_project}."
+        )
 
     gdf_metric, metric_crs_name = _to_metric_crs(gdf)
     footprints = build_project_footprints(
@@ -225,15 +272,21 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
     print(
         f"Phase 2 setup: base_project={base_project}, buffer={BUFFER_DISTANCE_KM:.1f} km, "
         f"leveling_rate={PARTIAL_LEVELING_RATE:.3f}, max_cycles={MAX_CYCLES}, "
+        f"reference_route_randomized={RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE}, "
         f"candidate_route_randomized={RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE}, "
-        f"clip_values={CLIP_PHASE2_VALUES}, clip_range=[{PHASE2_MIN_VALUE:.3g}, {clip_max_value:.3g}], "
+        f"clip_values={CLIP_PHASE2_VALUES}, clip_range=[{lod_floor:.3g}, {clip_max_value:.3g}], "
         f"metric_crs={metric_crs_name}"
     )
 
     completed_cycles = 0
     for cycle in range(1, MAX_CYCLES + 1):
         cycle_updates = 0
-        refs = ordered_projects
+        refs = _reference_order_for_cycle(
+            ordered_projects=ordered_projects,
+            start_project=base_project,
+            rng=rng,
+            randomize_tail=RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE,
+        )
 
         for reference_project in refs:
             progress.update(1)
@@ -510,8 +563,15 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
                     _clip_project_values(
                         gdf,
                         project_id=candidate,
-                        min_value=PHASE2_MIN_VALUE,
+                        min_value=lod_floor,
                         max_value=clip_max_value,
+                    )
+                else:
+                    _clip_project_values(
+                        gdf,
+                        project_id=candidate,
+                        min_value=lod_floor,
+                        max_value=None,
                     )
 
                 plot_rel = ""
@@ -580,6 +640,15 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
     else:
         output_projects = set(levelable_projects).difference(excluded_low_unique_values)
         final_out = gdf[gdf[PROJECT_COLUMN].isin(output_projects)].copy()
+
+    final_vals = pd.to_numeric(final_out[IMPUTED_VALUE_COLUMN], errors="coerce")
+    if CLIP_PHASE2_VALUES:
+        final_out[IMPUTED_VALUE_COLUMN] = final_vals.clip(
+            lower=lod_floor,
+            upper=clip_max_value,
+        )
+    else:
+        final_out[IMPUTED_VALUE_COLUMN] = final_vals.clip(lower=lod_floor)
 
     excluded_df = survey_qa[[PROJECT_COLUMN, "exclude_reason"]].copy()
     if excluded_low_unique_values:
