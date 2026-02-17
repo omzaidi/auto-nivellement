@@ -22,10 +22,14 @@ except ImportError:
     gaussian_filter = None
 
 # -------------------------- User-editable settings --------------------------
-INPUT_SHP = Path("output/phase2_leveled_partial_overlap.shp")
-OUTPUT_TIF = Path("output/phase3_ag_imp_idw.tif")
+# INPUT_SHP = Path("output/phase2_leveled_partial_overlap.shp")
+INPUT_SHP = Path("shp/AG_Fusionn_imp.shp")
+OUTPUT_TIF = Path("output/phase3_ag_imp_idw_pre.tif")
 
 VALUE_COLUMN = "Ag_imp"
+PHASE2_STATUS_COLUMN = "P2_STAT"
+FILTER_EXCLUDED_PHASE2_POINTS = True
+PHASE2_EXCLUDED_STATUS_PREFIXES = ("excluded_",)
 
 # Grid settings (in target CRS units, meters if projected)
 TARGET_CRS = None  # e.g. "EPSG:32198"; None => keep projected CRS or auto-UTM
@@ -89,9 +93,40 @@ def prepare_points(
     x = px[mask]
     y = py[mask]
     z = vals.to_numpy(dtype=float)[mask]
-    clean = gdf.loc[np.where(mask)[0]].copy()
+    # `mask` is positional; use iloc to avoid label-based KeyError on non-default indexes.
+    clean = gdf.iloc[np.flatnonzero(mask)].copy()
 
     return np.column_stack([x, y]), z, clean
+
+
+def filter_phase2_excluded_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if not FILTER_EXCLUDED_PHASE2_POINTS:
+        return gdf
+
+    if PHASE2_STATUS_COLUMN not in gdf.columns:
+        print(
+            f"{PHASE2_STATUS_COLUMN} not found; skipping exclusion filter in phase 3."
+        )
+        return gdf
+
+    status = gdf[PHASE2_STATUS_COLUMN].fillna("").astype(str)
+    excluded = np.zeros(len(gdf), dtype=bool)
+    for prefix in PHASE2_EXCLUDED_STATUS_PREFIXES:
+        excluded |= status.str.startswith(prefix)
+
+    n_excluded = int(excluded.sum())
+    if n_excluded > 0:
+        print(
+            f"Phase-2 exclusion filter: removed {n_excluded} points "
+            f"(prefixes={PHASE2_EXCLUDED_STATUS_PREFIXES})"
+        )
+
+    kept = gdf.iloc[np.flatnonzero(~excluded)].copy()
+    if kept.empty:
+        raise ValueError(
+            "No points left after phase-2 exclusion filtering; cannot interpolate."
+        )
+    return kept
 
 
 def compute_grid(bounds: tuple[float, float, float, float]) -> tuple[int, int, object]:
@@ -260,6 +295,8 @@ def run_interpolation() -> None:
     print(f"Reading leveled shapefile: {INPUT_SHP}")
     gdf = gpd.read_file(INPUT_SHP)
     print(f"Rows: {len(gdf)}")
+    gdf = filter_phase2_excluded_points(gdf)
+    print(f"Rows after phase-2 exclusion filter: {len(gdf)}")
 
     target_crs = choose_target_crs(gdf)
     if gdf.crs != target_crs:
