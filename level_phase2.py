@@ -7,6 +7,21 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from level_config import (
+    CENSORED_COLUMN,
+    IMPUTED_VALUE_COLUMN,
+    LITHOLOGY_COLUMN,
+    LOD_REFERENCE_SHP,
+    OUTPUT_DIR,
+    PHASE2_EXCLUDED_CSV_NAME,
+    PHASE2_INPUT_SHP,
+    PHASE2_LOG_CSV_NAME,
+    PHASE2_OUTPUT_NAME,
+    PHASE2_QA_CSV_NAME,
+    PHASE2_REGRESSION_PLOTS_DIRNAME,
+    PROJECT_COLUMN,
+    RAW_VALUE_COLUMN,
+)
 from level_core import (
     apply_correction,
     build_project_counts,
@@ -24,19 +39,8 @@ from level_core import (
 )
 
 # -------------------------- User-editable settings --------------------------
-ELEMENT = "Ba"
-ELEMENT_FILE_STEM = ELEMENT.lower()
-OUTPUT_DIR = Path("output")
-INPUT_SHP = OUTPUT_DIR / f"{ELEMENT_FILE_STEM}_phase1_leveled_full_overlap.shp"
-# Phase 2 reads the phase-1 output, but LOD floors should still come from the
-# original element file where raw censored values are defined.
-LOD_REFERENCE_SHP = Path(f"shp/{ELEMENT.upper()}_Fusionn_imp.shp")
-
-PROJECT_COLUMN = "NUMR_PROJ_"
-RAW_VALUE_COLUMN = ELEMENT
-IMPUTED_VALUE_COLUMN = f"{ELEMENT}_imp"
-CENSORED_COLUMN = "is_censor"
-LITHOLOGY_COLUMN = "CODE_TYPE_"
+# Main file/element settings live in level_config.py.
+INPUT_SHP = PHASE2_INPUT_SHP
 
 # Survey-level levelability rules
 MIN_PCT_ABOVE_OR_EQUAL_LOD = 0.70
@@ -54,7 +58,7 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 # Phase-2 cascade parameters (partial leveling)
 BUFFER_DISTANCE_KM = 20.0
 PHASE2_START_REFERENCE_PROJECT = "1997520"
-PARTIAL_LEVELING_RATE = 0.3
+PARTIAL_LEVELING_RATE = 0.5
 MAX_CYCLES = 5
 MIN_CYCLE_UPDATES = 1
 RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE = True
@@ -63,13 +67,9 @@ RANDOM_SEED = 42
 SKIP_FULL_OVERLAP_PAIRS = True
 
 # Outputs
-SAVE_REGRESSION_PLOTS = True
+SAVE_REGRESSION_PLOTS = False
 CLEAR_PLOT_DIR_ON_START = True
-REGRESSION_PLOTS_DIRNAME = f"{ELEMENT_FILE_STEM}_phase2_regression_plots"
-PHASE2_QA_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_survey_levelability.csv"
-PHASE2_LOG_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_leveling_log.csv"
-PHASE2_EXCLUDED_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_excluded_surveys.csv"
-PHASE2_OUTPUT_NAME = f"{ELEMENT_FILE_STEM}_phase2_leveled_partial_overlap.shp"
+REGRESSION_PLOTS_DIRNAME = PHASE2_REGRESSION_PLOTS_DIRNAME
 KEEP_ALL_PHASE2_INPUT_SURVEYS_IN_OUTPUT = True
 
 # Simple output stabilizer for phase 2
@@ -220,6 +220,13 @@ def _reference_order_for_cycle(
     return [start_project] + tail
 
 
+def _cycle_start_projects(
+    ordered_projects: list[str],
+    first_project: str,
+) -> list[str]:
+    return [first_project] + [p for p in ordered_projects if p != first_project]
+
+
 def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     lod_floor = compute_global_min_lod_floor(LOD_REFERENCE_SHP)
@@ -259,6 +266,7 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
             f"Requested phase-2 start reference {PHASE2_START_REFERENCE_PROJECT} "
             f"not found in levelable projects; fallback to {base_project}."
         )
+    cycle_start_projects = _cycle_start_projects(ordered_projects, base_project)
 
     gdf_metric, metric_crs_name = _to_metric_crs(gdf)
     buffer_m = float(BUFFER_DISTANCE_KM) * 1000.0
@@ -300,15 +308,19 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
         f"reference_route_randomized={RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE}, "
         f"candidate_route_randomized={RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE}, "
         f"clip_values={CLIP_PHASE2_VALUES}, clip_range=[{lod_floor:.3g}, {clip_max_value:.3g}], "
-        f"matching=direct_geometry_buffer, metric_crs={metric_crs_name}"
+        f"matching=direct_geometry_buffer, metric_crs={metric_crs_name}, "
+        f"cycle_start_count={len(cycle_start_projects)}"
     )
 
     completed_cycles = 0
     for cycle in range(1, MAX_CYCLES + 1):
         cycle_updates = 0
+        cycle_start_project = cycle_start_projects[
+            (cycle - 1) % len(cycle_start_projects)
+        ]
         refs = _reference_order_for_cycle(
             ordered_projects=ordered_projects,
-            start_project=base_project,
+            start_project=cycle_start_project,
             rng=rng,
             randomize_tail=RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE,
         )
@@ -363,7 +375,7 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
             for candidate in ordered_projects:
                 if candidate == reference_project:
                     continue
-                if candidate == base_project:
+                if candidate == cycle_start_project:
                     continue
                 if candidate in excluded_low_unique_values:
                     continue

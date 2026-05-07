@@ -6,6 +6,22 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from level_config import (
+    CENSORED_COLUMN,
+    IMPUTED_VALUE_COLUMN,
+    INPUT_SHP,
+    LITHOLOGY_COLUMN,
+    LOD_REFERENCE_SHP,
+    OUTPUT_DIR,
+    PHASE1_EXCLUDED_SURVEYS_CSV_NAME,
+    PHASE1_LOG_CSV_NAME,
+    PHASE1_OUTPUT_NAME,
+    PHASE1_REGRESSION_PLOTS_DIRNAME,
+    PHASE1_SURVEY_QA_CSV_NAME,
+    PROJECT_COLUMN,
+    RAW_VALUE_COLUMN,
+)
+
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -17,20 +33,7 @@ except ImportError:
     tqdm = None
 
 # -------------------------- User-editable settings --------------------------
-ELEMENT = "Ba"
-ELEMENT_FILE_STEM = ELEMENT.lower()
-INPUT_SHP = Path(f"shp/{ELEMENT.upper()}_Fusionn_imp.shp")
-# Keep this separate from INPUT_SHP so LODs can come from the original full
-# element file even if INPUT_SHP is later changed to a filtered/subset file.
-LOD_REFERENCE_SHP = INPUT_SHP
-OUTPUT_DIR = Path("output")
-
-PROJECT_COLUMN = "NUMR_PROJ_"
-RAW_VALUE_COLUMN = ELEMENT
-IMPUTED_VALUE_COLUMN = f"{ELEMENT}_imp"
-CENSORED_COLUMN = "is_censor"
-LITHOLOGY_COLUMN = "CODE_TYPE_"
-
+# Main file/element settings live in level_config.py.
 # Survey-level levelability rules
 MIN_PCT_ABOVE_OR_EQUAL_LOD = 0.70
 MAX_PCT_EQUAL_LOD = 0.30
@@ -45,12 +48,12 @@ TRIM_UPPER_QUANTILE = 0.9
 LINEAR_FIT_MIN_VARIANCE = 1e-16
 
 # Outputs
-SAVE_REGRESSION_PLOTS = True
-REGRESSION_PLOTS_DIRNAME = f"{ELEMENT_FILE_STEM}_phase1_regression_plots"
-FINAL_OUTPUT_NAME = f"{ELEMENT_FILE_STEM}_phase1_leveled_full_overlap.shp"
-LOG_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_leveling_log.csv"
-SURVEY_QA_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_survey_levelability.csv"
-EXCLUDED_SURVEYS_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_excluded_surveys.csv"
+SAVE_REGRESSION_PLOTS = False
+REGRESSION_PLOTS_DIRNAME = PHASE1_REGRESSION_PLOTS_DIRNAME
+FINAL_OUTPUT_NAME = PHASE1_OUTPUT_NAME
+LOG_CSV_NAME = PHASE1_LOG_CSV_NAME
+SURVEY_QA_CSV_NAME = PHASE1_SURVEY_QA_CSV_NAME
+EXCLUDED_SURVEYS_CSV_NAME = PHASE1_EXCLUDED_SURVEYS_CSV_NAME
 # ---------------------------------------------------------------------------
 
 

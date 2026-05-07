@@ -9,21 +9,37 @@ import pandas as pd
 import rasterio
 from rasterio.transform import from_origin
 
+from level_config import (
+    ELEMENT,
+    IMPUTED_VALUE_COLUMN,
+    PHASE3_INPUT_SHP,
+    PHASE3_OUTPUT_TIF,
+    PHASE3_VARIOGRAM_DIAGNOSTIC_DIR,
+)
 from level_core import make_progress
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 try:
     from scipy.spatial import cKDTree
 except ImportError:
     cKDTree = None
 
+try:
+    from scipy.optimize import least_squares
+except ImportError:
+    least_squares = None
+
 
 # -------------------------- User-editable settings --------------------------
-ELEMENT = "Ba"
-ELEMENT_FILE_STEM = ELEMENT.lower()
-INPUT_SHP = Path(f"output/{ELEMENT_FILE_STEM}_phase2_leveled_partial_overlap.shp")
-OUTPUT_TIF = Path(f"output/{ELEMENT_FILE_STEM}_phase3_imp_ordinary_kriging.tif")
+# Main file/element settings live in level_config.py.
+INPUT_SHP = PHASE3_INPUT_SHP
+OUTPUT_TIF = PHASE3_OUTPUT_TIF
 
-VALUE_COLUMN = f"{ELEMENT}_imp"
+VALUE_COLUMN = IMPUTED_VALUE_COLUMN
 PHASE2_STATUS_COLUMN = "P2_STAT"
 FILTER_EXCLUDED_PHASE2_POINTS = True
 PHASE2_EXCLUDED_STATUS_PREFIXES = ("excluded_",)
@@ -46,6 +62,13 @@ VARIOGRAM_SAMPLE_POINTS = 5_000
 VARIOGRAM_PAIR_COUNT = 80_000
 VARIOGRAM_RANDOM_SEED = 42
 VARIOGRAM_NUGGET_FRACTION = 0.05
+VARIOGRAM_FIT_MAX_LAG = 10_000.0
+VARIOGRAM_FIT_STATISTIC = "median"  # "median" or "mean"
+VARIOGRAM_MIN_PAIRS_PER_BIN = 30
+SAVE_VARIOGRAM_DIAGNOSTICS = True
+VARIOGRAM_DIAGNOSTIC_DIR = PHASE3_VARIOGRAM_DIAGNOSTIC_DIR
+VARIOGRAM_BIN_COUNT = 40
+VARIOGRAM_PLOT_SAMPLE_PAIRS = 10_000
 
 # Numerical stabilizer for local kriging systems
 KRIGING_MATRIX_JITTER = 1e-10
@@ -190,6 +213,273 @@ def spherical_semivariogram(
     return gamma
 
 
+def build_variogram_bins(
+    distances: np.ndarray,
+    semivariance: np.ndarray,
+    *,
+    bin_count: int,
+    max_lag: float | None = None,
+) -> pd.DataFrame:
+    if distances.size == 0:
+        return pd.DataFrame(
+            columns=[
+                "bin",
+                "distance_min",
+                "distance_max",
+                "distance_mid",
+                "pair_count",
+                "semivariance_mean",
+                "semivariance_median",
+            ]
+        )
+
+    max_distance = (
+        float(max_lag) if max_lag is not None else float(np.nanmax(distances))
+    )
+    edges = np.linspace(0.0, max_distance, max(2, int(bin_count) + 1))
+    rows: list[dict] = []
+    for bin_idx in range(len(edges) - 1):
+        lo = edges[bin_idx]
+        hi = edges[bin_idx + 1]
+        if bin_idx == len(edges) - 2:
+            keep = (distances >= lo) & (distances <= hi)
+        else:
+            keep = (distances >= lo) & (distances < hi)
+
+        vals = semivariance[keep]
+        rows.append(
+            {
+                "bin": bin_idx + 1,
+                "distance_min": lo,
+                "distance_max": hi,
+                "distance_mid": 0.5 * (lo + hi),
+                "pair_count": int(vals.size),
+                "semivariance_mean": float(np.nanmean(vals)) if vals.size else np.nan,
+                "semivariance_median": (
+                    float(np.nanmedian(vals)) if vals.size else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def sample_variogram_pairs(
+    points_xy: np.ndarray,
+    values: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    fit_max_lag = float(VARIOGRAM_FIT_MAX_LAG)
+    if fit_max_lag <= 0:
+        raise ValueError("VARIOGRAM_FIT_MAX_LAG must be positive.")
+
+    tree = cKDTree(points_xy)
+    pair_idx = tree.query_pairs(fit_max_lag, output_type="ndarray")
+    available_pairs = int(len(pair_idx))
+    if available_pairs == 0:
+        raise ValueError(
+            f"No point pairs found within VARIOGRAM_FIT_MAX_LAG={fit_max_lag:g}."
+        )
+
+    pair_count = min(int(VARIOGRAM_PAIR_COUNT), available_pairs)
+    if available_pairs > pair_count:
+        keep_idx = rng.choice(available_pairs, size=pair_count, replace=False)
+        pair_idx = pair_idx[keep_idx]
+
+    i = pair_idx[:, 0]
+    j = pair_idx[:, 1]
+    distances = np.linalg.norm(points_xy[i] - points_xy[j], axis=1)
+    semivariance = 0.5 * (values[i] - values[j]) ** 2
+    keep = np.isfinite(distances) & np.isfinite(semivariance) & (distances > 0)
+    return distances[keep], semivariance[keep], available_pairs
+
+
+def _initial_variogram_parameters(
+    bins: pd.DataFrame,
+    values: np.ndarray,
+    y_column: str,
+) -> tuple[float, float, float]:
+    fit_bins = bins[
+        (bins["pair_count"] >= VARIOGRAM_MIN_PAIRS_PER_BIN)
+        & np.isfinite(bins[y_column])
+    ]
+    if fit_bins.empty:
+        sill = float(np.nanvar(values))
+        nugget = float(np.clip(0.05 * sill, 0.0, VARIOGRAM_NUGGET_FRACTION * sill))
+        return nugget, sill, float(0.5 * VARIOGRAM_FIT_MAX_LAG)
+
+    y = fit_bins[y_column].to_numpy(dtype=float)
+    h = fit_bins["distance_mid"].to_numpy(dtype=float)
+    sill = float(np.nanquantile(y, 0.80))
+    if not np.isfinite(sill) or sill <= 0:
+        sill = float(np.nanvar(values))
+    nugget = float(y[0])
+    nugget = float(np.clip(nugget, 0.0, VARIOGRAM_NUGGET_FRACTION * sill))
+
+    target = nugget + 0.95 * max(sill - nugget, 0.0)
+    reached = h[y >= target]
+    if reached.size:
+        range_ = float(reached[0])
+    else:
+        range_ = float(np.nanmedian(h))
+    if not np.isfinite(range_) or range_ <= 0:
+        range_ = float(0.5 * VARIOGRAM_FIT_MAX_LAG)
+    return nugget, sill, range_
+
+
+def fit_spherical_variogram_to_bins(
+    bins: pd.DataFrame,
+    values: np.ndarray,
+) -> tuple[float, float, float, pd.DataFrame]:
+    y_column = (
+        "semivariance_median"
+        if VARIOGRAM_FIT_STATISTIC == "median"
+        else "semivariance_mean"
+    )
+    fit_bins = bins[
+        (bins["pair_count"] >= VARIOGRAM_MIN_PAIRS_PER_BIN)
+        & np.isfinite(bins[y_column])
+    ].copy()
+    if len(fit_bins) < 3 or least_squares is None:
+        nugget, sill, range_ = _initial_variogram_parameters(bins, values, y_column)
+        fit_bins["used_for_fit"] = True
+        return nugget, sill, range_, fit_bins
+
+    h = fit_bins["distance_mid"].to_numpy(dtype=float)
+    y = fit_bins[y_column].to_numpy(dtype=float)
+    weights = np.sqrt(
+        fit_bins["pair_count"].to_numpy(dtype=float)
+        / max(float(np.nanmedian(fit_bins["pair_count"])), 1.0)
+    )
+
+    nugget0, sill0, range0 = _initial_variogram_parameters(fit_bins, values, y_column)
+    partial0 = max(sill0 - nugget0, 1e-12)
+    max_y = max(float(np.nanmax(y)), float(np.nanvar(values)), 1e-12)
+    min_range = max(float(np.nanmin(h[h > 0])) * 0.25, 1.0)
+    max_range = max(float(VARIOGRAM_FIT_MAX_LAG) * 2.0, min_range * 2.0)
+
+    def residual(params: np.ndarray) -> np.ndarray:
+        nugget, partial_sill, range_ = params
+        model = spherical_semivariogram(
+            h,
+            nugget=nugget,
+            sill=nugget + partial_sill,
+            range_=range_,
+        )
+        return (model - y) * weights
+
+    result = least_squares(
+        residual,
+        x0=np.array([nugget0, partial0, range0], dtype=float),
+        bounds=(
+            np.array([0.0, 1e-12, min_range], dtype=float),
+            np.array([max_y, max_y * 5.0, max_range], dtype=float),
+        ),
+    )
+    nugget, partial_sill, range_ = result.x
+    sill = nugget + partial_sill
+    fit_bins["used_for_fit"] = True
+    return float(nugget), float(sill), float(range_), fit_bins
+
+
+def save_variogram_diagnostics(
+    distances: np.ndarray,
+    semivariance: np.ndarray,
+    *,
+    nugget: float,
+    sill: float,
+    range_: float,
+    bins: pd.DataFrame,
+) -> None:
+    if not SAVE_VARIOGRAM_DIAGNOSTICS:
+        return
+
+    VARIOGRAM_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+
+    bins_path = VARIOGRAM_DIAGNOSTIC_DIR / "empirical_variogram_bins.csv"
+    bins.to_csv(bins_path, index=False)
+
+    params_path = VARIOGRAM_DIAGNOSTIC_DIR / "fitted_variogram_parameters.csv"
+    pd.DataFrame(
+        [
+            {
+                "model": "spherical",
+                "nugget": nugget,
+                "sill": sill,
+                "range": range_,
+                "sampled_pair_count": int(distances.size),
+                "log_transform_values": LOG_TRANSFORM_VALUES,
+                "fit_max_lag": VARIOGRAM_FIT_MAX_LAG,
+                "fit_statistic": VARIOGRAM_FIT_STATISTIC,
+                "min_pairs_per_bin": VARIOGRAM_MIN_PAIRS_PER_BIN,
+            }
+        ]
+    ).to_csv(params_path, index=False)
+
+    if plt is None:
+        print(
+            "Saved variogram CSV diagnostics, but matplotlib is not available "
+            "so no variogram plot was created."
+        )
+        return
+
+    rng = np.random.default_rng(VARIOGRAM_RANDOM_SEED)
+    plot_count = min(int(VARIOGRAM_PLOT_SAMPLE_PAIRS), distances.size)
+    if plot_count < distances.size:
+        plot_idx = rng.choice(distances.size, size=plot_count, replace=False)
+    else:
+        plot_idx = np.arange(distances.size)
+
+    x_model = np.linspace(0.0, float(np.nanmax(distances)), 400)
+    y_model = spherical_semivariogram(
+        x_model,
+        nugget=nugget,
+        sill=sill,
+        range_=range_,
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.scatter(
+        distances[plot_idx],
+        semivariance[plot_idx],
+        s=5,
+        alpha=0.12,
+        color="#4c78a8",
+        label="sampled pairs",
+    )
+    good_bins = bins["pair_count"] > 0
+    y_column = (
+        "semivariance_median"
+        if VARIOGRAM_FIT_STATISTIC == "median"
+        else "semivariance_mean"
+    )
+    ax.scatter(
+        bins.loc[good_bins, "distance_mid"],
+        bins.loc[good_bins, y_column],
+        s=42,
+        color="#f58518",
+        label=f"binned {VARIOGRAM_FIT_STATISTIC}",
+        zorder=3,
+    )
+    ax.plot(x_model, y_model, color="#d62728", lw=2.0, label="spherical fit")
+    ax.axhline(sill, color="black", lw=1.0, ls="--", alpha=0.5, label="sill")
+    ax.axvline(range_, color="black", lw=1.0, ls=":", alpha=0.5, label="range")
+    ax.set_title(
+        f"{ELEMENT} phase 3 variogram | nugget={nugget:.3g}, "
+        f"sill={sill:.3g}, range={range_:.3g}"
+    )
+    ax.set_xlabel("Distance")
+    ax.set_ylabel("Semivariance")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="best")
+    fig.tight_layout()
+
+    plot_path = VARIOGRAM_DIAGNOSTIC_DIR / "fitted_variogram.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved variogram diagnostics: {bins_path}, {params_path}, {plot_path}")
+
+
 def estimate_spherical_variogram(
     points_xy: np.ndarray,
     values: np.ndarray,
@@ -204,44 +494,46 @@ def estimate_spherical_variogram(
     pts = points_xy[sample_idx]
     vals = values[sample_idx]
 
-    pair_count = min(int(VARIOGRAM_PAIR_COUNT), sample_n * max(sample_n - 1, 1) // 2)
-    i = rng.integers(0, sample_n, size=pair_count)
-    j = rng.integers(0, sample_n, size=pair_count)
-    keep = i != j
-    i = i[keep]
-    j = j[keep]
-
-    distances = np.linalg.norm(pts[i] - pts[j], axis=1)
-    semivariance = 0.5 * (vals[i] - vals[j]) ** 2
-    keep = np.isfinite(distances) & np.isfinite(semivariance) & (distances > 0)
-    distances = distances[keep]
-    semivariance = semivariance[keep]
+    distances, semivariance, available_pairs = sample_variogram_pairs(pts, vals, rng)
     if distances.size == 0:
         raise ValueError("Could not estimate a variogram from the input points.")
 
-    sill = float(np.nanvar(values))
-    if not np.isfinite(sill) or sill <= 0:
+    if not np.isfinite(np.nanvar(values)) or float(np.nanvar(values)) <= 0:
         raise ValueError("Input values have no variance; kriging cannot be fit.")
 
-    nugget = float(np.nanquantile(semivariance, 0.05))
-    nugget = float(np.clip(nugget, 0.0, VARIOGRAM_NUGGET_FRACTION * sill))
-
-    target_semivar = nugget + 0.95 * max(sill - nugget, 0.0)
-    order = np.argsort(distances)
-    sorted_dist = distances[order]
-    sorted_semivar = semivariance[order]
-    reached = sorted_dist[sorted_semivar >= target_semivar]
-    if reached.size:
-        range_ = float(np.nanquantile(reached, 0.10))
-    else:
-        range_ = float(np.nanquantile(distances, 0.80))
-    if not np.isfinite(range_) or range_ <= 0:
-        range_ = float(np.nanmedian(distances))
+    bins = build_variogram_bins(
+        distances,
+        semivariance,
+        bin_count=VARIOGRAM_BIN_COUNT,
+        max_lag=VARIOGRAM_FIT_MAX_LAG,
+    )
+    nugget, sill, range_, fit_bins = fit_spherical_variogram_to_bins(bins, values)
+    bins["used_for_fit"] = (
+        bins["pair_count"] >= VARIOGRAM_MIN_PAIRS_PER_BIN
+    ) & np.isfinite(
+        bins[
+            (
+                "semivariance_median"
+                if VARIOGRAM_FIT_STATISTIC == "median"
+                else "semivariance_mean"
+            )
+        ]
+    )
 
     print(
         "Estimated spherical variogram: "
-        f"sample_points={sample_n}, pairs={distances.size}, "
+        f"sample_points={sample_n}, local_pairs={distances.size}/{available_pairs}, "
+        f"fit_max_lag={VARIOGRAM_FIT_MAX_LAG:.6g}, "
+        f"fit_bins={len(fit_bins)}, statistic={VARIOGRAM_FIT_STATISTIC}, "
         f"nugget={nugget:.6g}, sill={sill:.6g}, range={range_:.6g}"
+    )
+    save_variogram_diagnostics(
+        distances,
+        semivariance,
+        nugget=nugget,
+        sill=sill,
+        range_=range_,
+        bins=bins,
     )
     return nugget, sill, range_
 
