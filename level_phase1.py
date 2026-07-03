@@ -744,6 +744,13 @@ def main() -> None:
     unknown_count = normalize_project_ids(gdf)
     if unknown_count:
         print(f"Normalized missing/None project IDs to 'Unknown': {unknown_count} rows")
+    
+    # Exclusion définitive des points sans numéro de levé (jamais candidat ni référence)
+    n_before = len(gdf)
+    gdf = gdf[gdf[PROJECT_COLUMN] != "Unknown"].reset_index(drop=True)
+    n_excluded = n_before - len(gdf)
+    if n_excluded:
+        print(f"Excluded {n_excluded} rows with Unknown project ID (removed before QA/leveling).")
 
     raw_nan_count, imp_nan_count = coerce_numeric_columns(gdf)
     print(

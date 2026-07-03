@@ -58,8 +58,8 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 # Phase-2 cascade parameters (partial leveling)
 BUFFER_DISTANCE_KM = 20.0
 PHASE2_START_REFERENCE_PROJECT = "1997520"
-PARTIAL_LEVELING_RATE = 0.5
-MAX_CYCLES = 5
+PARTIAL_LEVELING_RATE = 0.2
+MAX_CYCLES = 10
 MIN_CYCLE_UPDATES = 1
 RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE = True
 RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE = True
@@ -726,6 +726,13 @@ def main() -> None:
     unknown_count = normalize_project_ids(gdf, PROJECT_COLUMN)
     if unknown_count:
         print(f"Normalized missing/None project IDs to 'Unknown': {unknown_count} rows")
+    
+    # Exclusion définitive des points sans numéro de levé (jamais candidat ni référence)
+    n_before = len(gdf)
+    gdf = gdf[gdf[PROJECT_COLUMN] != "Unknown"].reset_index(drop=True)
+    n_excluded = n_before - len(gdf)
+    if n_excluded:
+        print(f"Excluded {n_excluded} rows with Unknown project ID (removed before QA/leveling).")
 
     raw_nan_count, imp_nan_count = coerce_numeric_columns(
         gdf,
